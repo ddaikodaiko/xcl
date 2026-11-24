@@ -476,8 +476,24 @@ impl Lw {
                 self.or(l, h)
             }
             "v_pack_b32_f16" => {
-                let lo = if m.opsel & 1 == 1 { self.lshrc(a, 16) } else { self.andc(a, 0xFFFF) };
-                let hi = if m.opsel & 2 == 2 { self.lshrc(b, 16) } else { self.andc(b, 0xFFFF) };
+                // f16 abs/neg are sign-bit operations on the selected half (VOP3 keeps them even
+                // though the packed source is 32-bit): abs clears bit 15, neg flips it.
+                let mut lo = if m.opsel & 1 == 1 { self.lshrc(a, 16) } else { self.andc(a, 0xFFFF) };
+                if m.abs[0] {
+                    lo = self.andc(lo, 0x7FFF);
+                }
+                if m.neg[0] {
+                    let s = self.c(0x8000);
+                    lo = self.xor(lo, s);
+                }
+                let mut hi = if m.opsel & 2 == 2 { self.lshrc(b, 16) } else { self.andc(b, 0xFFFF) };
+                if m.abs[1] {
+                    hi = self.andc(hi, 0x7FFF);
+                }
+                if m.neg[1] {
+                    let s = self.c(0x8000);
+                    hi = self.xor(hi, s);
+                }
                 let hi = self.shlc(hi, 16);
                 self.or(lo, hi)
             }
