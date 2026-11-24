@@ -2482,6 +2482,54 @@ impl Em {
                     uav("float")
                 ));
             }
+            _ if base.starts_with("atomic_") && {
+                let op = &base[7..];
+                (dmask == 3 && !op.ends_with("cmpswap")) || (dmask == 0xF && op.ends_with("cmpswap"))
+            } => {
+                // DMASK 0x3 works on 64 bits: VDATA[0:1] against the texel's two dwords
+                // (cmpswap: DMASK 0xF, VDATA[0:3]). 64-bit typed atomics need SM 6.6 int64
+                // support on the device; without it the program is refused rather than run
+                // on the low dword only.
+                let op = &base[7..];
+                if matches!(op, "cmpswap" | "fcmpswap" | "fmin" | "fmax") {
+                    return Err("image_atomic 64-bit cmpswap/float");
+                }
+                if dim == 6 {
+                    return Err("image_atomic 64-bit 2DMS");
+                }
+                if !self.opt.int64_image_atomics {
+                    return Err("image_atomic 64-bit (no int64 typed atomics)");
+                }
+                let (lo, hi) = (self.vreg(vdata), self.vreg(vdata + 1));
+                let signed = matches!(op, "smin" | "smax");
+                let vt = if signed { "int64_t" } else { "uint64_t" };
+                let val = if signed {
+                    format!("(int64_t)(((uint64_t){hi} << 32) | (uint64_t){lo})")
+                } else {
+                    format!("((uint64_t){hi} << 32) | (uint64_t){lo}")
+                };
+                self.line(&format!("RWTexture{rty}<{vt}> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];"));
+                self.line(&format!("{vt} {t}_v = {val};"));
+                self.line(&format!("{vt} {t}_old = 0;"));
+                let call = match op {
+                    "add" => format!("InterlockedAdd({t}_U[{icoord}], {t}_v, {t}_old)"),
+                    "sub" => format!("InterlockedAdd({t}_U[{icoord}], ({vt})0 - {t}_v, {t}_old)"),
+                    "smin" | "umin" => format!("InterlockedMin({t}_U[{icoord}], {t}_v, {t}_old)"),
+                    "smax" | "umax" => format!("InterlockedMax({t}_U[{icoord}], {t}_v, {t}_old)"),
+                    "and" => format!("InterlockedAnd({t}_U[{icoord}], {t}_v, {t}_old)"),
+                    "or" => format!("InterlockedOr({t}_U[{icoord}], {t}_v, {t}_old)"),
+                    "xor" => format!("InterlockedXor({t}_U[{icoord}], {t}_v, {t}_old)"),
+                    "swap" => format!("InterlockedExchange({t}_U[{icoord}], {t}_v, {t}_old)"),
+                    "inc" => format!("InterlockedAdd({t}_U[{icoord}], ({vt})1, {t}_old)"),
+                    "dec" => format!("InterlockedAdd({t}_U[{icoord}], ({vt})0 - ({vt})1, {t}_old)"),
+                    _ => return Err("image_atomic"),
+                };
+                self.line(&format!("if ({act}) {{ {call}; }}"));
+                if f("GLC") == 1 {
+                    self.line(&format!("if ({act}) {{ {lo} = (uint){t}_old; {hi} = (uint)({t}_old >> 32); }}"));
+                }
+            }
+            _ if base.starts_with("atomic_") && dmask != 1 && !(dmask == 3 && base.ends_with("cmpswap")) => return Err("image_atomic dmask"),
             _ if base.starts_with("atomic_") && matches!(&base[7..], "cmpswap" | "sub" | "inc" | "dec" | "fcmpswap" | "fmin" | "fmax") => {
                 // the operations without an int view: on the uint texel (CAS loops where needed)
                 let (v, cmp) = (self.vreg(vdata), self.vreg(vdata + 1));

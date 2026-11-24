@@ -540,6 +540,32 @@ pub fn init() -> Result<String, String> {
         }
         open_uma(&device);
         super::device_x::probe_dynamic_depth_bias(&device);
+        // 64-bit typed image atomics (SM 6.6): a translated image_atomic_* with DMASK 0x3
+        // needs both the typed-resource and the descriptor-heap support.
+        let (mut o9, mut o11) = (
+            D3D12_FEATURE_DATA_D3D12_OPTIONS9::default(),
+            D3D12_FEATURE_DATA_D3D12_OPTIONS11::default(),
+        );
+        let ok9 = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS9,
+                &mut o9 as *mut _ as *mut std::ffi::c_void,
+                size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS9>() as u32,
+            )
+            .is_ok();
+        let ok11 = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS11,
+                &mut o11 as *mut _ as *mut std::ffi::c_void,
+                size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS11>() as u32,
+            )
+            .is_ok();
+        let int64 = ok9
+            && o9.AtomicInt64OnTypedResourceSupported.as_bool()
+            && ok11
+            && o11.AtomicInt64OnDescriptorHeapResourceSupported.as_bool();
+        crate::gpu::recomp::set_int64_image_atomics(int64);
+        crate::xlog_info!("D3D12: 64-bit typed image atomics: {}", if int64 { "supported" } else { "not supported" });
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
         DEVICE.store(raw as usize, Ordering::Release);

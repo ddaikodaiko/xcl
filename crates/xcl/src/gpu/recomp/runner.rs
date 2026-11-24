@@ -424,7 +424,10 @@ pub fn split_for(mode: &super::Mode) -> bool {
 
 /// `Options` for programs run on this adapter: the split wave64 form where it is needed.
 pub fn options(mode: super::Mode) -> super::Options {
-    super::Options { split_wave64: split_for(&mode), mode, ..Default::default() }
+    // Synthetic GPU tests force the 64-bit image-atomic path; the runtime sets the flag from
+    // the device's OPTIONS9/11 in `real::init`, and the tests' refusal branch accepts a
+    // translation that cannot use it.
+    super::Options { split_wave64: split_for(&mode), mode, int64_image_atomics: true, ..Default::default() }
 }
 
 /// A split wave64 kernel stores the upper half's SGPRs too: both halves must end with the

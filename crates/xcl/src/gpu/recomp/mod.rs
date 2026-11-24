@@ -74,6 +74,7 @@ pub const HEAP_WINDOWS: u32 = 0x100;
 pub mod upper_lanes;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::dxbc::SigElement;
 use super::rdna2::{self, Decoded};
@@ -479,6 +480,18 @@ pub fn interface(blob: &[u8], sh: &super::xbox::XboxShader, f: &super::xbox::Fss
     }
 }
 
+/// 64-bit integer atomics on typed resources: set once the device's D3D12 options are known
+/// (`real::init`). `Options::default` reads it, so every translation path gets it.
+static INT64_IMAGE_ATOMICS: AtomicBool = AtomicBool::new(false);
+
+pub fn set_int64_image_atomics(supported: bool) {
+    INT64_IMAGE_ATOMICS.store(supported, Ordering::Relaxed);
+}
+
+pub fn int64_image_atomics() -> bool {
+    INT64_IMAGE_ATOMICS.load(Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone)]
 pub struct Options {
     pub mode: Mode,
@@ -510,11 +523,16 @@ pub struct Options {
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
+    /// the device supports 64-bit integer atomics on typed resources
+    /// (`D3D12_OPTIONS9::AtomicInt64OnTypedResourceSupported` and
+    /// `D3D12_OPTIONS11::AtomicInt64OnDescriptorHeapResourceSupported`). Without it a DMASK 0x3
+    /// image atomic is refused instead of running on the low dword only.
+    pub int64_image_atomics: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, int64_image_atomics: int64_image_atomics() }
     }
 }
 
