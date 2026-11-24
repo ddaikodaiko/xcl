@@ -1627,6 +1627,27 @@ fn gpu_typed_buffer_loads_and_stores() {
     assert_eq!(r.sgpr[50], 1 | 1 << 5, "s_bitset1");
 }
 
+/// `v_pack_b32_f16` with VOP3 modifiers: NEG on the low half and ABS on the high half are
+/// f16 sign-bit operations (abs: clear bit 15, neg: flip bit 15), not ignored.
+#[test]
+fn gpu_v_pack_b32_f16_honors_abs_neg() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("V_PACK_B32_F16", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 1), ("SRC1", V + 2), ("NEG", 1), ("ABS", 2)], None),
+    ]);
+    let mut st = KernelState::default();
+    for r in st.vgpr.iter_mut() {
+        r[1] = 0x3C00; // +1.0
+        r[2] = 0xC000; // -2.0
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    for lane in 0..64 {
+        assert_eq!(r.vgpr[lane][0], 0x4000_BC00, "lane {lane}: -1.0, |-2.0|");
+    }
+}
+
 fn el(name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8) -> crate::gpu::dxbc::SigElement {
     crate::gpu::dxbc::SigElement { name: name.into(), index, system_value: sv, component_type: ct, register: reg, mask, rw_mask: mask, stream: 0 }
 }

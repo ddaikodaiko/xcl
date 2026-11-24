@@ -3302,8 +3302,20 @@ impl Em {
             }
             "v_cvt_pkrtz_f16_f32" => format!("f16_rtz({}) | (f16_rtz({}) << 16)", fs(0), fs(1)),
             "v_pack_b32_f16" => {
-                let lo = if m.opsel & 1 == 1 { format!("({a} >> 16)") } else { format!("({a} & 0xFFFFu)") };
-                let hi = if m.opsel & 2 == 2 { format!("({b} >> 16)") } else { format!("({b} & 0xFFFFu)") };
+                // f16 abs/neg are sign-bit operations on the selected half (VOP3 keeps them
+                // even though the packed source is 32-bit)
+                let half = |x: &str, high: bool, i: usize| {
+                    let mut h = if high { format!("({x} >> 16)") } else { format!("({x} & 0xFFFFu)") };
+                    if m.abs[i] {
+                        h = format!("({h} & 0x7FFFu)");
+                    }
+                    if m.neg[i] {
+                        h = format!("({h} ^ 0x8000u)");
+                    }
+                    h
+                };
+                let lo = half(&a, m.opsel & 1 == 1, 0);
+                let hi = half(&b, m.opsel & 2 == 2, 1);
                 format!("{lo} | ({hi} << 16)")
             }
             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
