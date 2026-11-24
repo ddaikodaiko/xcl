@@ -743,6 +743,78 @@ impl Lw {
                 }
                 Ok(())
             }
+            _ if base.starts_with("atomic_") && {
+                let op = &base[7..];
+                (dmask == 3 && !op.ends_with("cmpswap")) || (dmask == 0xF && op.ends_with("cmpswap"))
+            } => {
+                // DMASK 0x3 works on 64 bits (cmpswap 0xF): VDATA[0:1] against the texel's two
+                // dwords. 64-bit typed atomics are an SM 6.6 device feature; heap_typed_atomic64
+                // declares them, as the HLSL emitter does with Options::int64_image_atomics.
+                let opn = &base[7..];
+                if matches!(opn, "cmpswap" | "fcmpswap" | "fmin" | "fmax") {
+                    return err(d, "image_atomic 64-bit cmpswap/float");
+                }
+                if dim == 6 {
+                    return err(d, "image_atomic 64-bit 2DMS");
+                }
+                let (vlo, vhi) = (self.vreg(vdata), self.vreg(vdata + 1));
+                let v = self.pack64(vlo, vhi);
+                let glc = f("GLC") == 1;
+                let ui = self.addc(tw0, 1);
+                let signed = opn == "smin" || opn == "smax";
+                let ct = if signed { CompType::I64 } else { CompType::U64 };
+                let (aop, v) = match opn {
+                    "add" => (AtomicOp::Add, v),
+                    "sub" => {
+                        let z = self.c64(0);
+                        (AtomicOp::Add, self.sub(z, v))
+                    }
+                    "smin" => (AtomicOp::IMin, v),
+                    "umin" => (AtomicOp::UMin, v),
+                    "smax" => (AtomicOp::IMax, v),
+                    "umax" => (AtomicOp::UMax, v),
+                    "and" => (AtomicOp::And, v),
+                    "or" => (AtomicOp::Or, v),
+                    "xor" => (AtomicOp::Xor, v),
+                    "swap" => (AtomicOp::Exchange, v),
+                    "inc" => (AtomicOp::Add, self.c64(1)),
+                    "dec" => {
+                        let z = self.c64(0);
+                        let one = self.c64(1);
+                        (AtomicOp::Add, self.sub(z, one))
+                    }
+                    _ => return err(d, "image_atomic"),
+                };
+                let (tl, th) = (self.tmp_var(), self.tmp_var());
+                let z = self.c(0);
+                self.wr(tl, z);
+                self.wr(th, z);
+                let ic2 = ic.clone();
+                self.guarded(act, &mut |lw| {
+                    lw.s.heap_typed_atomic64();
+                    let tex = lw.s.heap_texture(ui, lkind, true, ct, 1, true);
+                    let old = lw.s.atomic_binop(tex.handle, aop, &ic2, v);
+                    let (l, h) = lw.unpack64(old);
+                    lw.wr(tl, l);
+                    lw.wr(th, h);
+                    Ok(())
+                })?;
+                if glc {
+                    let a = self.act();
+                    for (var, otmp) in [(vdata, tl), (vdata + 1, th)] {
+                        let old = self.rd(otmp);
+                        let cur = self.vreg(var);
+                        let nv = self.sel(a, old, cur);
+                        self.wr(VAR_VGPR + var as u32, nv);
+                    }
+                }
+                Ok(())
+            }
+            _ if base.starts_with("atomic_") && dmask != 1 && !(dmask == 3 && base.ends_with("cmpswap")) => {
+                // the 32-bit atomics are DMASK 0x1, cmpswap DMASK 0x3; anything else is a form
+                // this lowering does not model (the HLSL emitter refuses it the same way)
+                err(d, "image_atomic dmask")
+            }
             _ if base.starts_with("atomic_") => {
                 let opn = &base[7..];
                 let (v, cmpv) = (self.vreg(vdata), self.vreg(vdata + 1));
