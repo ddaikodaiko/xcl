@@ -1313,6 +1313,7 @@ fn gpu_memory_and_exports() {
     st.sgpr[12] = 0x40; // V#: base 0x40, stride 0, 0x100 bytes
     st.sgpr[13] = 0;
     st.sgpr[14] = 0x100;
+    st.sgpr[15] = 3 << 28; // raw (OOB_SELECT 3)
     for (l, r) in st.vgpr.iter_mut().enumerate() {
         r[0] = 4 * l as u32;
         r[6] = f(0.5);
@@ -1357,7 +1358,7 @@ fn gpu_grouped_loads_bounds_and_inactive_lanes() {
     st.sgpr[4..8].copy_from_slice(&[0x80, 0, 20, 0]); // V#: base 0x80, 20 bytes
     st.sgpr[8..12].copy_from_slice(&[0x100, 0, 0x100, 0]); // V#: base 0x100, 0x100 bytes
     st.sgpr[12..16].copy_from_slice(&[0x100, 12 << 16, 40, 0]); // V#: base 0x100, stride 12, 40 records
-    st.sgpr[52..56].copy_from_slice(&[0x400, 0, 0x104, 0]); // V#: base 0x400, 0x104 bytes
+    st.sgpr[52..56].copy_from_slice(&[0x400, 0, 0x104, 3 << 28]); // V#: base 0x400, 0x104 bytes, raw
     for (l, r) in st.vgpr.iter_mut().enumerate() {
         r[1] = l as u32;
         r[2] = 8 * l as u32;
@@ -1541,7 +1542,7 @@ fn gpu_typed_buffer_loads_and_stores() {
     }
     let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
     let bgra = 6 | 5 << 3 | 4 << 6 | 7 << 9;
-    let vs = |base: u32, fmt: u32, sel: u32| [base, 0, 0x100, sel | fmt << 12];
+    let vs = |base: u32, fmt: u32, sel: u32| [base, 0, 0x100, sel | fmt << 12 | 3 << 28];
     let code = prog(&[
         ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 3), ("SOFFSET", 128)], None),             // A
         ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 14), ("SRSRC", 4), ("SOFFSET", 128)], None),             // B
@@ -1577,7 +1578,7 @@ fn gpu_typed_buffer_loads_and_stores() {
         vs(0x118, 8, ident),
         vs(0x11C, 36, ident),
         vs(0x120, 0, ident),
-        [0x400, 0, 0x100, 0],
+        [0x400, 0, 0x100, 3 << 28],
     ]
     .iter()
     .enumerate()
@@ -1625,6 +1626,75 @@ fn gpu_typed_buffer_loads_and_stores() {
     assert_eq!(r.mem[0x130 / 4], 0xB800_4000, "d16 store 16_16_float");
     assert_eq!(&r.mem[0x150 / 4..0x160 / 4], &[f(0.0), f(1.0), f(1.25), f(-4.5)], "32_32_32_32 store");
     assert_eq!(r.sgpr[50], 1 | 1 << 5, "s_bitset1");
+}
+
+/// MUBUF V# `OOB_SELECT` (word 3 [29:28]), measured on RDNA2 (Leonida docs/buffer_bounds.md):
+/// mode 0 checks `index >= N || offset + 4 > STRIDE`, mode 3 (raw) checks
+/// `offset + soffset + 4 > N`. The old translator used `stride == 0` for the raw form and left
+/// soffset out of the check.
+#[test]
+fn gpu_mubuf_oob_select_raw_soffset_and_structured_stride() {
+    if !gpu_ready() {
+        return;
+    }
+    let vs = |base: u32, stride: u32, n: u32, oob: u32| [base, (stride & 0x3FFF) << 16, n, oob << 28];
+    let code = prog(&[
+        // raw, N 18, voff 8, soffset 8: 8+8+4 > 18 -> out
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 136), ("OFFEN", 1)], None),
+        // mode 0, stride 16, voff 13: 13+4 > 16 -> out
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 11), ("VADDR", 1), ("SRSRC", 4), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        // mode 0, stride 16, voff 8: 8+4 <= 16 -> in
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 12), ("VADDR", 2), ("SRSRC", 5), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        // raw, N 18, voff 8, soffset 0: 8+0+4 <= 18 -> in
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 13), ("VADDR", 3), ("SRSRC", 6), ("SOFFSET", 128), ("OFFEN", 1)], None),
+    ]);
+    let mut mem = vec![0u32; 512];
+    for i in 0..0x40 {
+        mem[0x100 / 4 + i] = 0xA000_0000 | i as u32;
+        mem[0x200 / 4 + i] = 0xB000_0000 | i as u32;
+        mem[0x300 / 4 + i] = 0xC000_0000 | i as u32;
+        mem[0x400 / 4 + i] = 0xD000_0000 | i as u32;
+    }
+    let mut st = KernelState::default();
+    st.sgpr[12..16].copy_from_slice(&vs(0x100, 0, 18, 3));
+    st.sgpr[16..20].copy_from_slice(&vs(0x200, 16, 48, 0));
+    st.sgpr[20..24].copy_from_slice(&vs(0x300, 16, 48, 0));
+    st.sgpr[24..28].copy_from_slice(&vs(0x400, 0, 18, 3));
+    for r in st.vgpr.iter_mut() {
+        r[0] = 8;
+        r[1] = 13;
+        r[2] = 8;
+        r[3] = 8;
+    }
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    for lane in 0..64 {
+        let v = &r.vgpr[lane];
+        assert_eq!(v[10], 0, "lane {lane}: raw 8+8+4 > 18");        assert_eq!(v[11], 0, "lane {lane}: structured 13+4 > 16");
+    }
+    assert_eq!(r.vgpr[0][12], 0xC000_0002, "mode 0 in range (0x308)");
+    assert_eq!(r.vgpr[0][13], 0xD000_0002, "raw in range (0x408)");
+}
+
+/// `s_buffer_load_dword` checks the whole dword: `offset + 4 <= limit` (the old check was
+/// `offset < limit`, so a dword that starts below the limit but ends past it read memory).
+#[test]
+fn gpu_s_buffer_load_limit_includes_the_dword() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("S_BUFFER_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 10), ("SBASE", 6), ("OFFSET", 0), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 11), ("SBASE", 8), ("OFFSET", 0), ("SOFFSET", 125)], None),
+    ]);
+    let mut mem = vec![0u32; 256];
+    mem[0x100 / 4] = 0xAAAA_0001;
+    mem[0x110 / 4] = 0xBBBB_0002;
+    let mut st = KernelState::default();
+    st.sgpr[12..16].copy_from_slice(&[0x100, 0, 3, 0]); // N 3: 0 + 4 > 3 -> out
+    st.sgpr[16..20].copy_from_slice(&[0x110, 0, 4, 0]); // N 4: 0 + 4 <= 4 -> in
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    assert_eq!(r.sgpr[10], 0, "s_buffer_load: the dword ends past N=3");
+    assert_eq!(r.sgpr[11], 0xBBBB_0002, "s_buffer_load: N=4");
 }
 
 fn el(name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8) -> crate::gpu::dxbc::SigElement {
@@ -4603,7 +4673,7 @@ fn gpu_global_atomics_and_sub_dword_access() {
     code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
     let mut st = KernelState::default();
     st.sgpr[2] = 0x600;
-    st.sgpr[24..28].copy_from_slice(&[0x700, 0, 0x200, 0]);
+    st.sgpr[24..28].copy_from_slice(&[0x700, 0, 0x200, 3 << 28]);
     for (l, r) in st.vgpr.iter_mut().enumerate() {
         let l32 = l as u32;
         r[2] = 2 * l32;
@@ -7187,7 +7257,7 @@ fn gpu_pknorm_i16_f32_nan_and_fmt_encode_snorm_ufloat() {
         return;
     }
     let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
-    let vs = |base: u32, fmt: u32| [base, 0, 0x100, ident | fmt << 12];
+    let vs = |base: u32, fmt: u32| [base, 0, 0x100, ident | fmt << 12 | 3 << 28];
     // Formats: 43 = 11_11_10_FLOAT (X:10b, Y:11b, Z:11b), 36 = 10_11_11_FLOAT (X:11b, Y:11b, Z:10b), 24 = 16_16_SNORM
     let p = prog(&[
         ("V_CVT_PKNORM_I16_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 0), ("SRC1", V + 0)], None), // (NaN, NaN)

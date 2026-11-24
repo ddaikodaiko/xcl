@@ -1495,29 +1495,32 @@ impl Em {
         if name.starts_with("s_buffer_load") {
             // V#: base = dw0 | dw1[15:0] << 32, stride = dw1[29:16], num_records = dw2
             let (d0, d1, d2) = (self.sreg(sbase), self.sreg(sbase + 1), self.sreg(sbase + 2));
-            self.line(&format!("uint {t}_off = {} + {soff};", hex(imm)));
+            self.line(&format!("uint64_t {t}_off = (uint64_t){} + (uint64_t){soff};", hex(imm)));
             self.line(&format!("uint {t}_st = ({d1} >> 16) & 0x3FFFu;"));
-            self.line(&format!("uint {t}_lim = select({t}_st == 0u, {d2}, {d2} * {t}_st);"));
+            self.line(&format!("uint64_t {t}_lim = select({t}_st == 0u, (uint64_t){d2}, (uint64_t){d2} * (uint64_t){t}_st);"));
             if self.opt.mem_windows > 1 {
                 self.line(&format!("uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){t}_off;"));
                 self.window_read(&format!("(uint)({t}_ea >> 32)"));
                 self.line(&format!("uint {t}_a = (uint){t}_ea & ~3u;"));
             } else {
-                self.line(&format!("uint {t}_a = ({d0} + {t}_off) & ~3u;"));
+                self.line(&format!("uint {t}_a = (uint)((uint64_t){d0} + {t}_off) & ~3u;"));
             }
             // Branch-free: a dword past num_records reads offset 0 (always in the window) and
             // comes out 0. HLSL 2021's `?:` is a branch, and with several memory windows every
             // access is a switch between them (`windowed`): one per dword made DXC several
             // times slower on big programs. Four dwords share one switch (`xcl_loadx4`).
             if count == 1 {
-                self.line(&format!("bool {t}_in = {t}_off < {t}_lim;"));
+                self.line(&format!("bool {t}_in = {t}_off + 4ull <= {t}_lim;"));
                 self.line(&format!("uint {t}_0 = select({t}_in, mem.Load(select({t}_in, {t}_a, 0u)), 0u);"));
                 vals.push(format!("{t}_0"));
             } else {
                 for g in 0..count.div_ceil(4) {
                     let n = (count - 4 * g).min(4);
                     let o = (0..4).map(|k| format!("{}u", 16 * g + 4 * k.min(n - 1))).collect::<Vec<_>>().join(", ");
-                    self.line(&format!("bool4 {t}_in{g} = {t}_off + uint4({o}) < {t}_lim;"));
+                    let oks: Vec<String> = (0..4)
+                        .map(|k| format!("{t}_off + {}ull <= {t}_lim", 16 * g + 4 * k.min(n - 1) + 4))
+                        .collect();
+                    self.line(&format!("bool4 {t}_in{g} = bool4({});", oks.join(", ")));
                     self.line(&format!("uint4 {t}_g{g} = select({t}_in{g}, xcl_loadx4(select({t}_in{g}, {t}_a + uint4({o}), 0u)), 0u);"));
                     vals.extend(["x", "y", "z", "w"][..n].iter().map(|c| format!("{t}_g{g}.{c}")));
                 }
@@ -1702,8 +1705,9 @@ impl Em {
         let t = self.t();
         let is_store = small.map_or(matches!(kind, BufKind::Store | BufKind::FormatStore), |(_, _, s)| s);
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
+        self.line(&format!("uint {t}_oob = ({d3} >> 28) & 3u;"));
+        self.line(&format!("uint64_t {t}_off = (uint64_t){voff} + {}ull;", f("OFFSET")));
         if self.opt.mem_windows > 1 {
-            self.line(&format!("uint64_t {t}_off = (uint64_t){voff} + (uint64_t){}u;", f("OFFSET")));
             self.line(&format!(
                 "uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_off + (uint64_t){t}_stride * (uint64_t){index};"
             ));
@@ -1714,17 +1718,21 @@ impl Em {
             }
             self.line(&format!("uint {t}_a = (uint){t}_ea;"));
         } else {
-            self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
-            self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
+            self.line(&format!(
+                "uint64_t {t}_ea = (uint64_t){d0} + (uint64_t){soff} + {t}_off + (uint64_t){t}_stride * (uint64_t){index};"
+            ));
+            self.line(&format!("uint {t}_a = (uint){t}_ea;"));
         }
         let act = self.act();
-        let multi = self.opt.mem_windows > 1;
         let in_range = |bytes: String| {
-            if multi {
-                format!("select({t}_stride == 0u, {t}_off + (uint64_t)({bytes}) <= (uint64_t){d2}, {index} < {d2})")
-            } else {
-                format!("select({t}_stride == 0u, {t}_off + {bytes} <= {d2}, {index} < {d2})")
-            }
+            // V# word 3 [29:28] OOB_SELECT, measured on RDNA2 (Leonida docs/buffer_bounds.md).
+            // In range: mode 0 index < N and offset + bytes <= STRIDE; 1 index < N;
+            // 2 N != 0; 3 (raw) offset + soffset + bytes <= N; index * stride is not checked.
+            let c0 = format!("and({index} < {d2}, {t}_off + (uint64_t)({bytes}) <= (uint64_t){t}_stride)");
+            let c1 = format!("({index} < {d2})");
+            let c2 = format!("({d2} != 0u)");
+            let c3 = format!("({t}_off + (uint64_t){soff} + (uint64_t)({bytes}) <= (uint64_t){d2})");
+            format!("or(and({t}_oob == 0u, {c0}), or(and({t}_oob == 1u, {c1}), or(and({t}_oob == 2u, {c2}), and({t}_oob == 3u, {c3}))))")
         };
         if let Some((n, signed, store)) = small {
             let ok = in_range(format!("{n}u"));
