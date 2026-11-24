@@ -1627,6 +1627,42 @@ fn gpu_typed_buffer_loads_and_stores() {
     assert_eq!(r.sgpr[50], 1 | 1 << 5, "s_bitset1");
 }
 
+/// An out-of-range 7-bit buffer format (78..127) is INVALID on RDNA2: loads return 0 and
+/// stores are no-ops. It must not alias to format 77 (32_32_32_32_FLOAT).
+#[test]
+fn gpu_invalid_buffer_format_reads_zero_and_stores_nothing() {
+    if !gpu_ready() {
+        return;
+    }
+    let vs = |base: u32, fmt: u32| [base, 0, 0x100, (4 | 5 << 3 | 6 << 6 | 7 << 9) | fmt << 12];
+    let code = prog(&[
+        ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 3), ("SOFFSET", 128)], None),
+        ("BUFFER_STORE_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 14), ("SRSRC", 4), ("SOFFSET", 128)], None),
+    ]);
+    let mut mem = vec![0u32; 512];
+    for i in 0..4 {
+        mem[0x100 / 4 + i] = 0x3F80_0000 + i as u32; // nonzero floats behind the load
+        mem[0x200 / 4 + i] = 0xAAAA_0000 + i as u32; // the store target
+    }
+    let mut st = KernelState::default();
+    st.sgpr[12..16].copy_from_slice(&vs(0x100, 80));
+    st.sgpr[16..20].copy_from_slice(&vs(0x200, 80));
+    for r in st.vgpr.iter_mut() {
+        r[14] = 0x1111_1111;
+        r[15] = 0x2222_2222;
+        r[16] = 0x3333_3333;
+        r[17] = 0x4444_4444;
+    }
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    for lane in 0..64 {
+        let v = &r.vgpr[lane];
+        assert_eq!([v[10], v[11], v[12], v[13]], [0; 4], "lane {lane}: invalid format load");
+    }
+    for i in 0..4 {
+        assert_eq!(r.mem[0x200 / 4 + i], 0xAAAA_0000 + i as u32, "invalid format store {i}");
+    }
+}
+
 fn el(name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8) -> crate::gpu::dxbc::SigElement {
     crate::gpu::dxbc::SigElement { name: name.into(), index, system_value: sv, component_type: ct, register: reg, mask, rw_mask: mask, stream: 0 }
 }
