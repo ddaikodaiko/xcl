@@ -650,15 +650,19 @@ impl Lw {
             let (d0, d1, d2) = (self.sreg(sbase), self.sreg(sbase + 1), self.sreg(sbase + 2));
             let k = self.c(imm);
             let off = self.add(k, soff);
+            // offsets and limits are 64-bit, as the HLSL path (`uint64_t off`, `lim`): the
+            // immediate plus soffset can carry past 4 GiB
+            let off64 = self.add(self.zext64(k), self.zext64(soff));
             self.buffer_window(d0, d1, &[Ea::U(k), Ea::U(soff)], false);
             let st = self.lshrc(d1, 16);
             let st = self.andc(st, 0x3FFF);
             let sz = self.cmpc(Pred::Eq, st, 0);
-            let lim = self.mul(d2, st);
-            let lim = self.sel(sz, d2, lim);
+            let lim = self.mul(self.zext64(d2), self.zext64(st));
+            let lim = self.sel(sz, self.zext64(d2), lim);
             for i in 0..count {
                 let o = self.addc(off, 4 * i);
-                let ok = self.cmp(Pred::ULt, o, lim);
+                let e = self.add(off64, self.c64(4 + 4 * i as u64));
+                let ok = self.cmp(Pred::ULe, e, lim);
                 let a = self.add(d0, o);
                 let v = self.mem_ld(a);
                 let z = self.c(0);
@@ -734,12 +738,34 @@ impl Lw {
         let a = self.add(a, si);
         self.buffer_window(d0, d1, &[Ea::U(soff), Ea::U(voff), Ea::K(f("OFFSET") as u32), Ea::Mul(stride, index)], name.contains("store"));
         let act = self.act();
-        let szero = self.cmpc(Pred::Eq, stride, 0);
-        let idx_ok = self.cmp(Pred::ULt, index, d2);
+        let oob_shift = self.lshrc(d3, 28);
+        let oob = self.andc(oob_shift, 3);
+        // the bounds are 64-bit, as the HLSL path: voffset + OFFSET can carry past 4 GiB
+        let off64 = self.add(self.zext64(voff), self.c64(f("OFFSET") as u64));
         let in_range = |lw: &mut Lw, bytes: Value| -> Value {
-            let e = lw.add(off, bytes);
-            let ok = lw.cmp(Pred::ULe, e, d2);
-            lw.sel(szero, ok, idx_ok)
+            // V# word 3 [29:28] OOB_SELECT: 0 index < N and offset+bytes <= STRIDE; 1 index < N;
+            // 2 N != 0; 3 (raw) offset+soffset+bytes <= N.
+            let idx_lt = lw.cmp(Pred::ULt, index, d2);
+            let bytes64 = lw.zext64(bytes);
+            let e0 = lw.add(off64, bytes64);
+            let fit = lw.cmp(Pred::ULe, e0, lw.zext64(stride));
+            let c0 = lw.land(idx_lt, fit);
+            let c1 = lw.cmp(Pred::ULt, index, d2);
+            let c2 = lw.cmpc(Pred::Ne, d2, 0);
+            let s1 = lw.add(off64, lw.zext64(soff));
+            let e3 = lw.add(s1, bytes64);
+            let c3 = lw.cmp(Pred::ULe, e3, lw.zext64(d2));
+            let q0 = lw.cmpc(Pred::Eq, oob, 0);
+            let q1 = lw.cmpc(Pred::Eq, oob, 1);
+            let q2 = lw.cmpc(Pred::Eq, oob, 2);
+            let q3 = lw.cmpc(Pred::Eq, oob, 3);
+            let s0 = lw.land(q0, c0);
+            let s1 = lw.land(q1, c1);
+            let s2 = lw.land(q2, c2);
+            let s3 = lw.land(q3, c3);
+            let l01 = lw.lor(s0, s1);
+            let l23 = lw.lor(s2, s3);
+            lw.lor(l01, l23)
         };
         if let Some((n, signed, store, half)) = d16s {
             let nb = self.c(n);
@@ -1209,6 +1235,8 @@ impl Lw {
         let a = self.add(a, si);
         self.buffer_window(d0, d1, &[Ea::U(soff), Ea::U(voff), Ea::K(f("OFFSET") as u32), Ea::Mul(stride, index)], true);
         let a = self.andc(a, !(bytes - 1));
+        // buffer atomics keep the old stride==0 heuristic: the HLSL fix this ports does not
+        // change them, and this port stays the same change on the other translator
         let szero = self.cmpc(Pred::Eq, stride, 0);
         let e = self.addc(off, bytes);
         let r1 = self.cmp(Pred::ULe, e, d2);
