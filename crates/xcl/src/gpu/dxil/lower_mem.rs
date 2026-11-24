@@ -287,8 +287,9 @@ impl Lw {
             }
         };
         let k = self.c(77);
-        let i = self.umin(fmt, k);
+        let le = self.cmp(Pred::ULe, fmt, k);
         let z = self.c(0);
+        let i = self.sel(le, fmt, z);
         let p = self.s.m.gep(g, &[z, i]);
         self.s.m.load(p, 4)
     }
